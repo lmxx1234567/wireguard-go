@@ -657,6 +657,7 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotMarshalDNSMessage
 	}
 
+	parentCtx := ctx
 	for _, useUDP := range []bool{true, false} {
 		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
 		defer cancel()
@@ -691,6 +692,10 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 				err = errCanceled
 			} else if err == context.DeadlineExceeded {
 				err = errTimeout
+			}
+			// A silent UDP path must not prevent use of the same server over TCP.
+			if useUDP && parentCtx.Err() == nil {
+				continue
 			}
 			return dnsmessage.Parser{}, dnsmessage.Header{}, err
 		}
