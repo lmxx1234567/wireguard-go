@@ -650,6 +650,16 @@ func dnsStreamRoundTrip(c net.Conn, id uint16, query dnsmessage.Question, b []by
 	return p, h, nil
 }
 
+// Only a timed-out UDP exchange warrants an additional TCP attempt. Parent
+// cancellation and non-timeout errors must remain visible to the caller.
+func retryDNSTimeout(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var timeout net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout())
+}
+
 func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Question, timeout time.Duration) (dnsmessage.Parser, dnsmessage.Header, error) {
 	q.Class = dnsmessage.ClassINET
 	id, udpReq, tcpReq, err := newRequest(q)
@@ -657,9 +667,9 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotMarshalDNSMessage
 	}
 
+	parentCtx := ctx
 	for _, useUDP := range []bool{true, false} {
 		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
-		defer cancel()
 
 		var c net.Conn
 		var err error
@@ -670,11 +680,14 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 		}
 
 		if err != nil {
+			cancel()
 			return dnsmessage.Parser{}, dnsmessage.Header{}, err
 		}
 		if d, ok := ctx.Deadline(); ok && !d.IsZero() {
 			err := c.SetDeadline(d)
 			if err != nil {
+				c.Close()
+				cancel()
 				return dnsmessage.Parser{}, dnsmessage.Header{}, err
 			}
 		}
@@ -686,7 +699,11 @@ func (tnet *Net) exchange(ctx context.Context, server netip.Addr, q dnsmessage.Q
 			p, h, err = dnsStreamRoundTrip(c, id, q, tcpReq)
 		}
 		c.Close()
+		cancel()
 		if err != nil {
+			if useUDP && retryDNSTimeout(parentCtx, err) {
+				continue
+			}
 			if err == context.Canceled {
 				err = errCanceled
 			} else if err == context.DeadlineExceeded {

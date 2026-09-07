@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"net"
+	"time"
 
 	socks5 "github.com/things-go/go-socks5"
 	"golang.zx2c4.com/wireguard/device"
@@ -17,8 +18,41 @@ import (
 
 // netstackResolver resolves hostnames inside the tunnel via the netstack DNS,
 // so SOCKS5 requests for internal names work without touching the host resolver.
-type netstackResolver struct {
-	tnet *netstack.Net
+type tunnelNetwork interface {
+	LookupContextHost(context.Context, string) ([]string, error)
+	DialContext(context.Context, string, string) (net.Conn, error)
+}
+type resolvedAddressesKey struct{}
+type netstackResolver struct{ tnet tunnelNetwork }
+
+// Retain every answer; go-socks5's resolver interface itself returns only one IP.
+func dialResolved(ctx context.Context, network, addr string, tnet tunnelNetwork) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	ips, _ := ctx.Value(resolvedAddressesKey{}).([]string)
+	if len(ips) == 0 {
+		return tnet.DialContext(ctx, network, addr)
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	var firstErr error
+	for _, ip := range ips {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		attempt, stop := context.WithTimeout(ctx, 2*time.Second)
+		conn, err := tnet.DialContext(attempt, network, net.JoinHostPort(ip, port))
+		stop()
+		if err == nil {
+			return conn, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, firstErr
 }
 
 func (r netstackResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
@@ -33,10 +67,36 @@ func (r netstackResolver) Resolve(ctx context.Context, name string) (context.Con
 	if name == "" || name == "0" {
 		return ctx, net.IPv4zero, nil
 	}
-	addrs, err := r.tnet.LookupHost(name)
+	lookupCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	addrs, err := r.tnet.LookupContextHost(lookupCtx, name)
 	if err != nil {
 		return ctx, nil, err
 	}
+	// Alternate address families, starting with IPv4. This leaves time to try
+	// IPv6 even when many IPv4 answers are unreachable; no reachability is assumed.
+	var v4, v6 []string
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			v4 = append(v4, addr)
+		} else {
+			v6 = append(v6, addr)
+		}
+	}
+	addrs = make([]string, 0, len(v4)+len(v6))
+	for i := 0; i < len(v4) || i < len(v6); i++ {
+		if i < len(v4) {
+			addrs = append(addrs, v4[i])
+		}
+		if i < len(v6) {
+			addrs = append(addrs, v6[i])
+		}
+	}
+	ctx = context.WithValue(ctx, resolvedAddressesKey{}, addrs)
 	for _, a := range addrs {
 		if ip := net.ParseIP(a); ip != nil {
 			return ctx, ip, nil
@@ -66,7 +126,7 @@ func startSocks5(listen, username, password string, tnet *netstack.Net, logger *
 	opts := []socks5.Option{
 		socks5.WithResolver(netstackResolver{tnet: tnet}),
 		socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return tnet.DialContext(ctx, network, addr)
+			return dialResolved(ctx, network, addr, tnet)
 		}),
 		socks5.WithLogger(socksLogger{logger: logger}),
 	}
