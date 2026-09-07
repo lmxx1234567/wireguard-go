@@ -3,8 +3,11 @@ package netstack
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"golang.org/x/net/dns/dnsmessage"
 	"io"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -52,5 +55,31 @@ func TestDNSFallsBackToTCPAfterUDPTimeout(t *testing.T) {
 	_, h, err := n.exchange(ctx, ip, q, 500*time.Millisecond)
 	if err != nil || !h.Response {
 		t.Fatalf("TCP fallback failed: %v %+v", err, h)
+	}
+}
+
+func TestDNSFallbackErrorPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"socket timeout", &net.OpError{Op: "read", Err: context.DeadlineExceeded}, true},
+		{"wrapped deadline", fmt.Errorf("query: %w", context.DeadlineExceeded), true},
+		{"non-timeout I/O", io.ErrUnexpectedEOF, false},
+		{"malformed response", errCannotUnmarshalDNSMessage, false},
+		{"cancelled attempt", context.Canceled, false},
+		{"other error", errors.New("unreachable"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryDNSTimeout(context.Background(), tc.err); got != tc.want {
+				t.Fatalf("retry=%v, want %v", got, tc.want)
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if retryDNSTimeout(ctx, context.DeadlineExceeded) {
+		t.Fatal("cancelled parent must not retry")
 	}
 }

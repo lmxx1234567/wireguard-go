@@ -9,7 +9,6 @@ package main
 import (
 	"context"
 	"net"
-	"sort"
 	"time"
 
 	socks5 "github.com/things-go/go-socks5"
@@ -74,11 +73,29 @@ func (r netstackResolver) Resolve(ctx context.Context, name string) (context.Con
 	if err != nil {
 		return ctx, nil, err
 	}
-	// Prefer the working IPv4 path, retaining IPv6 for IPv6-only destinations
-	// and fallback. Do not change the host resolver or leak internal queries.
-	sort.SliceStable(addrs, func(i, j int) bool {
-		return net.ParseIP(addrs[i]).To4() != nil && net.ParseIP(addrs[j]).To4() == nil
-	})
+	// Alternate address families, starting with IPv4. This leaves time to try
+	// IPv6 even when many IPv4 answers are unreachable; no reachability is assumed.
+	var v4, v6 []string
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil {
+			v4 = append(v4, addr)
+		} else {
+			v6 = append(v6, addr)
+		}
+	}
+	addrs = make([]string, 0, len(v4)+len(v6))
+	for i := 0; i < len(v4) || i < len(v6); i++ {
+		if i < len(v4) {
+			addrs = append(addrs, v4[i])
+		}
+		if i < len(v6) {
+			addrs = append(addrs, v6[i])
+		}
+	}
 	ctx = context.WithValue(ctx, resolvedAddressesKey{}, addrs)
 	for _, a := range addrs {
 		if ip := net.ParseIP(a); ip != nil {
